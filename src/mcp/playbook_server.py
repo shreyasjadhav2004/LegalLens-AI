@@ -22,7 +22,7 @@ class PlaybookServer:
         for filename in os.listdir(self.playbook_dir):
             if filename.endswith(".json"):
                 contract_type = filename.replace(".json", "")
-                with open(os.path.join(self.playbook_dir, filename), 'r') as f:
+                with open(os.path.join(self.playbook_dir, filename), 'r', encoding='utf-8', errors='replace') as f:
                     self.playbooks[contract_type] = json.load(f)
 
     def get_playbook(self, contract_type: str) -> Optional[Dict[str, Any]]:

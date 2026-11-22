@@ -2,16 +2,14 @@ import streamlit as st
 import asyncio
 import tempfile
 import os
+import re
 from pathlib import Path
 from src.tools.pdf_parser import DocumentParser
-from src.agent import root_agent
-from google.adk.runners import InMemoryRunner
-from google.genai import types
+from src.ollama_client import check_ollama_health, chat_stream
+from src.utils.docx_generator import generate_docx
 
 import base64
 from dotenv import load_dotenv
-from google import genai
-from src.utils.docx_generator import generate_docx
 
 load_dotenv()
 
@@ -121,20 +119,39 @@ def displayPDF(file_path):
 with st.sidebar:
     st.title("⚖️ Multi Agent System")
     st.markdown("---")
-    st.markdown("""
-    **System Status:** 🟢 Online
     
-    **Agents Active:**
-    - 🔍 Intake Agent
-    - 📄 Clause Extractor
-    - ⚠️ Risk Scorer
-    - 📚 Playbook Auditor
-    - 📝 Report Generator
-    """)
+    # Show Ollama status
+    health = check_ollama_health()
+    if health["ok"]:
+        ollama_model = os.getenv("OLLAMA_MODEL", "phi3:latest")
+        st.markdown(f"""
+**System Status:** 🟢 Online
+
+**Backend:** 🦙 Ollama (local)
+**Model:** `{ollama_model}`
+
+**Agents Active:**
+- 🔍 Intake Agent
+- 📄 Clause Extractor
+- ⚠️ Risk Scorer
+- 📚 Playbook Auditor
+- 📝 Report Generator
+""")
+    else:
+        st.error(f"⚠️ Ollama Offline\n\n{health['error']}")
+        st.info(health["hint"])
 
 # --- Main Content ---
 st.title("Contract Review System")
 st.markdown("Upload a legal contract (PDF) for comprehensive AI analysis against company playbooks.")
+
+# Show a warning banner if Ollama is not available
+if not health["ok"]:
+    st.error(
+        f"**❌ Ollama is not available.** {health['error']}\n\n"
+        f"**How to fix:** {health['hint']}"
+    )
+    st.stop()
 
 uploaded_file = st.file_uploader("Drop your contract here", type="pdf")
 
@@ -206,8 +223,6 @@ if uploaded_file is not None:
                 )
             
             with btn_col2:
-                # Use a popover for the copy functionality
-                # This is cleaner than an expander and uses native Streamlit features
                 with st.popover("📋 Copy Report Text", use_container_width=True):
                     st.markdown("Click the copy icon in the top right of the code block:")
                     st.code(st.session_state.report_text, language="markdown")
@@ -232,15 +247,19 @@ if uploaded_file is not None:
         # Use the same python executable that is running streamlit
         cmd = [sys.executable, "run_single.py", tmp_path]
         
-        # Copy current env and set unbuffered output
+        # Copy current env and set unbuffered output + UTF-8 mode
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONUTF8"] = "1"  # Force UTF-8 on Windows (avoids cp1252 UnicodeEncodeError)
+        env["PYTHONIOENCODING"] = "utf-8"
         
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             universal_newlines=True,
             env=env
@@ -263,10 +282,9 @@ if uploaded_file is not None:
         current_progress = 0.0
         
         # 3. Stream Output with Progress Indicators
-        # Create progress UI elements in report area
         progress_bar = report_placeholder.progress(0.0)
         status_text = st.empty()
-        status_text.markdown("🚀 **Starting analysis...")
+        status_text.markdown("🚀 **Starting analysis...**")
         
         while True:
             line = process.stdout.readline()
@@ -321,7 +339,7 @@ if uploaded_file is not None:
                 if "report_generator_agent" in line or "ReportGenerator" in line:
                     if not progress_stages["report"]["complete"]:
                         status_text.markdown(f"⏳ **{progress_stages['report']['name']}** - Synthesizing final report...")
-                        current_progress += progress_stages["report"]["weight"] * 0.5  # 50% of report weight
+                        current_progress += progress_stages["report"]["weight"] * 0.5
                         progress_bar.progress(min(current_progress, 1.0))
                 
                 # Capture Contract Text
@@ -336,8 +354,6 @@ if uploaded_file is not None:
                     continue
 
                 # Logic to separate Debug vs Report
-                # We look for specific markers that indicate the final report
-                # Triggers: Agent name, Title, or Executive Summary
                 is_report_line = (
                     "report_generator_agent >" in line or 
                     "# Contract Review Report" in line or 
@@ -357,29 +373,26 @@ if uploaded_file is not None:
                 if is_report_content:
                     # Mark report stage as complete and clear progress UI
                     if not progress_stages["report"]["complete"]:
-                        current_progress = 1.0  # Complete
+                        current_progress = 1.0
                         progress_stages["report"]["complete"] = True
-                        # Clear all progress UI elements
                         status_text.empty()
                     
                     # Skip debug print statements from report content
                     if "ReportGenerator: Formatting final report" not in line:
                         full_report_text += line
                     
-                    # Always display the accumulated report (even if this line was filtered)
+                    # Always display the accumulated report
                     if full_report_text.strip():
                         report_placeholder.markdown(full_report_text)
                 else:
                     # Debug logs
                     if "---REPORT_START---" not in line:
                         full_debug_text += line
-                        # Update the debug log placeholder
                         debug_placeholder.code(full_debug_text, language="text")
 
         # Clean up the report text
         def clean_report_text(text):
             """Remove conversational filler and markdown code fences from report."""
-            import re
             # Remove markdown code fences
             text = re.sub(r'^```markdown\s*\n', '', text, flags=re.MULTILINE)
             text = re.sub(r'\n```\s*$', '', text, flags=re.MULTILINE)
@@ -392,11 +405,18 @@ if uploaded_file is not None:
             ]
             for prefix in prefixes_to_remove:
                 text = re.sub(prefix, '', text, flags=re.IGNORECASE)
-            # Strip leading/trailing whitespace
             text = text.strip()
             return text
         
         full_report_text = clean_report_text(full_report_text)
+        
+        # If no report was parsed from the pipe, try to read stderr for error messages
+        if not full_report_text.strip():
+            stderr_output = process.stderr.read()
+            if stderr_output:
+                st.error(f"Analysis failed. Agent error:\n\n```\n{stderr_output[:2000]}\n```")
+            else:
+                st.warning("Analysis completed but no report was generated. Check the Agent Traces panel for details.")
         
         if process.returncode == 0:
             st.sidebar.success("✅ Analysis Complete!")
@@ -408,7 +428,14 @@ if uploaded_file is not None:
             st.rerun()
         else:
             stderr = process.stderr.read()
-            st.error(f"Process failed with error: {stderr}")
+            if "Cannot connect to Ollama" in stderr or "Ollama Error" in stderr:
+                st.error(
+                    "**❌ Ollama connection failed.**\n\n"
+                    "Make sure Ollama is running (`ollama serve`) and the model is downloaded "
+                    f"(`ollama pull {os.getenv('OLLAMA_MODEL', 'phi3:latest')}`)."
+                )
+            else:
+                st.error(f"Process failed with error:\n```\n{stderr[:2000]}\n```")
 
     # --- Chat Interface ---
     if st.session_state.analysis_complete:
@@ -427,42 +454,55 @@ if uploaded_file is not None:
             with st.chat_message("user"):
                 st.markdown(prompt)
 
-            # Generate response
+            # Generate response via Ollama (streaming)
             with st.chat_message("assistant"):
                 response_placeholder = st.empty()
                 full_response = ""
                 
                 try:
-                    client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
-                    
-                    # Construct context
-                    context = f"""
-                    You are a helpful legal assistant. You have analyzed a contract.
-                    
-                    CONTRACT TEXT:
-                    {st.session_state.contract_text}
-                    
-                    ANALYSIS REPORT:
-                    {st.session_state.report_text}
-                    
-                    User Question: {prompt}
-                    
-                    Answer the user's question based on the contract and the report. Be concise and helpful.
-                    """
-                    
-                    response = client.models.generate_content_stream(
-                        model="gemini-2.0-flash-exp",
-                        contents=context
+                    # Build OpenAI-style message list for the chat endpoint
+                    system_content = (
+                        "You are a helpful legal assistant. You have analyzed a contract. "
+                        "Answer questions based ONLY on the contract text and the analysis report provided. "
+                        "Be concise, precise, and cite specific clauses when relevant."
                     )
-                    
-                    for chunk in response:
-                        full_response += chunk.text
-                        response_placeholder.markdown(full_response)
-                        
+                    context_content = (
+                        f"CONTRACT TEXT:\n{st.session_state.contract_text[:4000]}\n\n"
+                        f"ANALYSIS REPORT:\n{st.session_state.report_text[:3000]}"
+                    )
+
+                    messages = [
+                        {"role": "system", "content": system_content},
+                        {"role": "user", "content": context_content},
+                        {"role": "assistant", "content": "I have reviewed the contract and the analysis report. I am ready to answer your questions."},
+                    ]
+
+                    # Add prior conversation history (last 6 turns to stay within context)
+                    for msg in st.session_state.messages[-6:]:
+                        messages.append({"role": msg["role"], "content": msg["content"]})
+
+                    # Stream the response
+                    for chunk in chat_stream(messages):
+                        full_response += chunk
+                        response_placeholder.markdown(full_response + "▌")
+
+                    response_placeholder.markdown(full_response)
                     st.session_state.messages.append({"role": "assistant", "content": full_response})
                     
-                except Exception as e:
-                    st.error(f"Error generating response: {e}")
+                except Exception as exc:
+                    error_msg = str(exc)
+                    if "Cannot connect to Ollama" in error_msg:
+                        st.error(
+                            "**❌ Ollama connection lost.** "
+                            "Make sure Ollama is still running: `ollama serve`"
+                        )
+                    elif "timed out" in error_msg.lower():
+                        st.error(
+                            "**⏱️ Response timed out.** "
+                            "The model may be busy. Try again in a moment."
+                        )
+                    else:
+                        st.error(f"Error generating response: {exc}")
             
     # Cleanup (optional, maybe keep it for debugging or move inside button)
     # os.unlink(tmp_path)

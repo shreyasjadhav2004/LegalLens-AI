@@ -58,6 +58,7 @@ share/python-wheels/
 MANIFEST
 
 # Virtual environments
+.venv/
 contract_reviewer/
 venv/
 env/

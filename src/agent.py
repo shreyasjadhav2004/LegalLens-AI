@@ -1,61 +1,129 @@
 """
-Contract Review Multi-Agent System - Agent Definitions
-Using Google Agent Development Kit (ADK)
+Contract Review Multi-Agent Pipeline – Ollama Backend
+======================================================
+This module replicates the original 5-stage multi-agent workflow that was
+built with Google ADK, but drives every LLM call through a locally running
+Ollama model instead of the Gemini API.
 
-This file defines all agents for the contract review workflow using proper ADK Agent classes.
+The architecture is preserved:
+  Stage 1 – Intake Agent        (was ADK Sequential Agent)
+  Stage 2 – Clause Extractor    (was ADK Loop Agent, max 10 iterations)
+  Stage 3 – Risk Scorer         (was ADK Parallel Agent)
+  Stage 4 – Playbook Comparator (was ADK Sequential Agent + MCP)
+  Stage 5 – Report Generator    (was ADK Sequential Agent)
+
+Why no Google ADK?
+  google.adk.agents.Agent only supports Google-hosted models (Gemini).
+  There is no official adapter for Ollama as of the migration date.
+  Rather than wrap ADK around an incompatible backend, we implement the
+  same orchestration logic directly so the workflow remains identical.
+
+Tool functions (score_clause_risk, compare_to_playbook, format_markdown_report)
+are kept with the same signatures so app.py and run_single.py can still
+reference them and the agent trace output matches the original progress
+parsing in app.py.
 """
 
-from google.adk.agents import Agent, SequentialAgent, ParallelAgent, LoopAgent
+import json
+import sys
+from typing import Optional
 
-from .config import MODEL_ID
+from .config import OLLAMA_MODEL
+from .ollama_client import generate, generate_stream_collect, extract_json
 from .tools.pdf_parser import DocumentParser
 from .tools.risk_matrix import RiskMatrix
 from .mcp.playbook_server import PlaybookServer
-import json
 
-# Initialize tools and services
+# ---------------------------------------------------------------------------
+# Shared services (unchanged from original)
+# ---------------------------------------------------------------------------
+
 pdf_parser = DocumentParser()
 risk_matrix = RiskMatrix()
 playbook_server = PlaybookServer("data/playbooks")
 
-# ==================== AGENT 1: INTAKE AGENT (Sequential) ====================
+
+# ---------------------------------------------------------------------------
+# Tool functions (preserved signatures so app.py progress tracking works)
+# ---------------------------------------------------------------------------
 
 def analyze_contract_metadata(contract_text: str, filename: str, pages: int) -> dict:
     """
-    Extracts high-level metadata from contract including type, parties, dates, and terms.
-    This is a tool function for the Intake Agent.
-    
-    Args:
-        contract_text: Full contract text
-        filename: Name of the contract file
-        pages: Number of pages
-        
-    Returns:
-        Dictionary with contract metadata
+    Extracts high-level metadata from a contract.
+    Called internally by the intake agent stage.
     """
     print("\n🔍 IntakeAgent: Analyzing contract metadata...")
-    # This function will be called by the LLM agent with proper parameters
-    # The actual extraction is done via the agent's instruction
     return {
         "status": "tool_called",
-        "message": "Contract metadata extraction initiated"
+        "message": "Contract metadata extraction initiated",
     }
 
-intake_agent = Agent(
-    model=MODEL_ID,
-    name="contract_intake_agent",
-    description="Classifies contract type and extracts high-level metadata from contracts",
-    instruction="""You are a legal contract intake specialist. When given a contract text, you must:
 
-1. Classify the contract type (SaaS Agreement, Employment Agreement, NDA, MSA, etc.)
-2. Extract contracting parties (Provider/Vendor and Customer/Employee)
-3. Extract key dates (effective date, term length, expiration date)
-4. Identify auto-renewal terms (yes/no, notice period)
-5. Determine jurisdiction and governing law
-6. Extract contract value if mentioned
-7. Assess document quality (complete, signed, issues)
+def extract_clause_from_section(
+    section_title: str, section_text: str, contract_type: str
+) -> dict:
+    """
+    Extracts structured clause information from a contract section.
+    Called internally by the clause extraction stage.
+    """
+    print(f"\n📄 ClauseExtractor: Extracting from section '{section_title}'...")
+    return {
+        "status": "clause_extraction_initiated",
+        "section": section_title,
+    }
 
-Always respond in valid JSON format with this exact structure:
+
+def score_clause_risk(clause_type: str, clause_text: str, key_terms: dict) -> dict:
+    """
+    Scores the risk level of a specific clause using the risk matrix.
+    """
+    print(f"\n⚠️  RiskScorer: Scoring risk for '{clause_type}' clause...")
+    risk_result = risk_matrix.evaluate_risk(clause_type, key_terms)
+    return risk_result
+
+
+def compare_to_playbook(
+    clause_type: str, actual_value: str, contract_type: str
+) -> dict:
+    """
+    Compares an actual contract term against company playbook standards.
+    """
+    print(f"\n📚 PlaybookAgent: Comparing '{clause_type}' to standards...")
+
+    normalized_type = contract_type.lower().replace(" ", "_")
+    if "employment" in normalized_type:
+        normalized_type = "employment_agreement"
+    elif "saas" in normalized_type:
+        normalized_type = "saas_agreement"
+    elif "nda" in normalized_type or "non-disclosure" in normalized_type:
+        normalized_type = "nda"
+    elif "msa" in normalized_type or "master_services" in normalized_type:
+        normalized_type = "msa"
+
+    comparison = playbook_server.compare_term(normalized_type, clause_type, actual_value)
+    return comparison
+
+
+def format_markdown_report(report_data: dict) -> str:
+    """
+    Signals that the final Markdown report has been generated.
+    """
+    print("\n📝 ReportGenerator: Formatting final report...")
+    return "Report generation completed. The markdown report should be in the agent's response."
+
+
+# ---------------------------------------------------------------------------
+# STAGE 1 – Intake Agent
+# ---------------------------------------------------------------------------
+
+INTAKE_SYSTEM = """You are a legal contract intake specialist. Analyze the contract and extract metadata.
+
+CRITICAL RULES:
+- Respond ONLY with valid JSON, no extra text, no markdown fences.
+- Use null for unknown fields, not empty strings.
+- Dates must be YYYY-MM-DD or null.
+
+Return this exact JSON structure:
 {
   "contract_type": "string",
   "contract_subtype": "string or null",
@@ -66,57 +134,69 @@ Always respond in valid JSON format with this exact structure:
   "effective_date": "YYYY-MM-DD or null",
   "term_length": "string",
   "expiration_date": "YYYY-MM-DD or null",
-  "auto_renewal": true/false,
+  "auto_renewal": true or false,
   "renewal_notice_period": "string or null",
   "jurisdiction": "string or null",
   "governing_law": "string or null",
   "estimated_value": "string or null",
   "document_quality": {
-    "complete": true/false,
-    "signed": true/false,
+    "complete": true or false,
+    "signed": true or false,
     "issues": []
   },
-  "confidence": 0.0 to 1.0
+  "confidence": 0.85
 }"""
-)
 
-# ==================== AGENT 2: CLAUSE EXTRACTION AGENT (Loop) ====================
 
-def extract_clause_from_section(section_title: str, section_text: str, contract_type: str) -> dict:
-    """
-    Extracts structured clause information from a contract section.
-    
-    Args:
-        section_title: Title of the section
-        section_text: Text content of the section
-        contract_type: Type of contract being analyzed
-        
-    Returns:
-        Extracted clause data
-    """
-    print(f"\n📄 ClauseExtractor: Extracting from section '{section_title}'...")
-    return {
-        "status": "clause_extraction_initiated",
-        "section": section_title
-    }
+def run_intake_agent(contract_text: str, filename: str, pages: int) -> dict:
+    """Stage 1: Classify and extract contract metadata."""
+    print("contract_intake_agent > running intake analysis", flush=True)
 
-clause_extractor_agent = Agent(
-    model=MODEL_ID,
-    name="clause_extraction_agent",
-    description="Extracts and structures individual clauses from contract sections",
-    instruction="""You are a legal clause extraction specialist. For each contract section provided, extract:
+    prompt = f"""Analyze this contract and return JSON metadata only.
 
-1. clause_type (license_grant, payment_terms, limitation_of_liability, data_privacy, etc.)
-2. section_title
-3. Full clause text
-4. key_terms (structured data: amounts, dates, percentages, conditions)
-5. confidence score
+CONTRACT FILE: {filename}
+PAGES: {pages}
 
-For SaaS contracts, look for: license_grant, payment_terms, term_and_termination, warranties, limitation_of_liability, indemnification, data_privacy, service_level_agreement, confidentiality, dispute_resolution, auto_renewal
+CONTRACT TEXT:
+{contract_text[:8000]}
 
-For Employment contracts, look for: position_and_duties, compensation_and_benefits, non_compete, non_solicitation, confidentiality, ip_assignment, termination_conditions, severance
+Return ONLY the JSON object, nothing else."""
 
-Always respond in JSON format:
+    raw = generate(prompt, system=INTAKE_SYSTEM, temperature=0.1)
+    result = extract_json(raw)
+
+    # Safely handle list or non-dict responses
+    if isinstance(result, list):
+        if result and isinstance(result[0], dict):
+            result = result[0]
+        else:
+            result = {}
+
+    if not isinstance(result, dict) or result.get("parse_error"):
+        print("⚠️  Intake agent returned non-JSON; using defaults.", flush=True)
+        result = {
+            "contract_type": "Unknown",
+            "parties": {"provider": "Unknown", "customer": "Unknown"},
+            "confidence": 0.3,
+        }
+
+    print(f"✅ contract_intake_agent > Contract type: {result.get('contract_type', 'Unknown')}", flush=True)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# STAGE 2 – Clause Extraction (Loop Agent – up to 10 sections)
+# ---------------------------------------------------------------------------
+
+CLAUSE_SYSTEM = """You are a legal clause extraction specialist. Extract structured clause information.
+
+CRITICAL RULES:
+- Respond ONLY with valid JSON, no extra text, no markdown fences.
+- Split distinct concepts into separate clause entries (e.g., role vs salary vs start date = 3 entries).
+- For SaaS: license_grant, payment_terms, term_and_termination, warranties, limitation_of_liability, indemnification, data_privacy, service_level_agreement, confidentiality, dispute_resolution, auto_renewal
+- For Employment: position_and_duties, compensation_and_benefits, non_compete, non_solicitation, confidentiality, ip_assignment, termination_conditions, severance
+
+Return this exact JSON structure:
 {
   "clauses": [
     {
@@ -124,100 +204,103 @@ Always respond in JSON format:
       "section_title": "string",
       "text": "string",
       "key_terms": {},
-      "confidence": 0.0-1.0
+      "confidence": 0.85
     }
   ]
-}
+}"""
 
-If no clauses found, return {"clauses": []}.
 
-IMPORTANT: Do not group distinct concepts into a single "Offer Details" or "General" clause. You MUST split them.
-For example, if a paragraph mentions the role, the salary, and the start date, you must create THREE separate clause entries:
-1. "position_and_duties"
-2. "compensation_and_benefits"
-3. "term_of_employment"
+def run_clause_extraction_agent(
+    contract_text: str, contract_type: str, max_iterations: int = 10
+) -> list[dict]:
+    """Stage 2: Extract all clauses from the contract (loop over sections)."""
 
-Even if they are in the same paragraph, extract them as separate logical clauses."""
-)
+    # Split contract into sections for iterative processing
+    lines = contract_text.split("\n")
+    sections = []
+    current_section = {"title": "Introduction", "text": ""}
 
-# The Loop Agent will iterate through sections and call clause_extractor_agent
-clause_extraction_loop = LoopAgent(
-    name="clause_extraction_loop_agent",
-    description="Iterates through contract sections to extract all clauses",
-    sub_agents=[clause_extractor_agent],  # The agent to run on each iteration
-    max_iterations=10  # Limit iterations
-)
+    for line in lines:
+        stripped = line.strip()
+        is_header = (
+            (stripped.isupper() and 5 < len(stripped) < 100)
+            or any(
+                stripped.startswith(f"{n}.")
+                for n in range(1, 25)
+            )
+            or stripped.lower().startswith(("section", "article", "clause"))
+        )
+        if is_header and stripped:
+            if current_section["text"].strip():
+                sections.append(current_section)
+            current_section = {"title": stripped, "text": ""}
+        else:
+            current_section["text"] += line + "\n"
 
-# ==================== AGENT 3: RISK SCORING AGENT (Parallel) ====================
+    if current_section["text"].strip():
+        sections.append(current_section)
 
-def score_clause_risk(clause_type: str, clause_text: str, key_terms: dict) -> dict:
-    """
-    Scores the risk level of a specific clause using the risk matrix.
-    
-    Args:
-        clause_type: Type of clause
-        clause_text: Full clause text
-        key_terms: Extracted key terms
-        
-    Returns:
-        Risk assessment for the clause
-    """
-    print(f"\n⚠️  RiskScorer: Scoring risk for '{clause_type}' clause...")
-    # Use the risk matrix tool
-    risk_result = risk_matrix.evaluate_risk(clause_type, key_terms)
-    return risk_result
+    # If no sections found, treat the whole document as one section
+    if not sections:
+        sections = [{"title": "Full Contract", "text": contract_text}]
 
-risk_scorer_agent = Agent(
-    model=MODEL_ID,
-    name="risk_scoring_agent",
-    description="Evaluates risk levels for contract clauses",
-    instruction="""You are a legal risk assessment specialist. 
+    all_clauses: list[dict] = []
+    iterations = 0
 
-CRITICAL: When you receive clause data, you MUST immediately call the score_clause_risk tool. 
-DO NOT ask for clarification. DO NOT wait for user input. Analyze the clause directly.
+    for section in sections[:max_iterations]:
+        iterations += 1
+        print(
+            f"clause_extraction_agent > iteration {iterations}: processing '{section['title']}'",
+            flush=True,
+        )
+        print(f"📄 ClauseExtractor: Extracting from section '{section['title']}'...", flush=True)
 
-For each clause, analyze and assign a risk level:
+        section_text = section["text"].strip()
+        if len(section_text) < 30:
+            continue
 
-Risk Levels:
-- CRITICAL (9-10): Deal-breakers, must address before signing
-- HIGH (7-8): Significant concerns, should negotiate  
-- MEDIUM (4-6): Moderate issues, consider negotiating
-- LOW (1-3): Minor concerns or standard terms
+        prompt = f"""Extract clauses from this contract section. Contract type: {contract_type}
 
-Consider these factors by clause type:
+SECTION: {section['title']}
+TEXT:
+{section_text[:3000]}
 
-Compensation & Benefits:
-- CRITICAL: Unpaid or below minimum wage
-- HIGH: Below market rate by >20%
-- MEDIUM: Below market rate by 10-20%
+Return ONLY the JSON object with a "clauses" array."""
 
-Limitation of Liability:
-- CRITICAL: No cap or < 3 months fees
-- HIGH: < 12 months fees
-- MEDIUM: < 24 months fees
+        raw = generate(prompt, system=CLAUSE_SYSTEM, temperature=0.1)
+        result = extract_json(raw)
 
-Data Privacy/Ownership:
-- CRITICAL: Vendor owns customer data, no privacy protections
-- HIGH: Ambiguous ownership, broad vendor usage rights
+        if isinstance(result, list):
+            clauses = result
+        elif isinstance(result, dict):
+            clauses = result.get("clauses", [])
+        else:
+            clauses = []
 
-Non-Compete:
-- CRITICAL: Overly broad (>18 months or unlimited geography)
-- HIGH: Broad scope (12-18 months, large geography)
-- MEDIUM: Reasonable (6-12 months, limited geography)
+        if isinstance(clauses, list):
+            for c in clauses:
+                if isinstance(c, dict):
+                    all_clauses.append(c)
 
-Service Level Agreement:
-- CRITICAL: Missing entirely for critical services
-- HIGH: No service credits, uptime < 99%
+    print(f"✅ clause_extraction_agent > extracted {len(all_clauses)} clauses", flush=True)
+    return all_clauses
 
-Payment Terms:
-- HIGH: Full payment in advance, non-refundable
-- MEDIUM: Payment terms > Net 45
 
-Call the score_clause_risk tool with the clause data provided. Output JSON format:
+# ---------------------------------------------------------------------------
+# STAGE 3 – Risk Scoring (Parallel Agent – all clauses, using risk matrix)
+# ---------------------------------------------------------------------------
+
+RISK_SYSTEM = """You are a legal risk assessment specialist. Evaluate the risk of a contract clause.
+
+CRITICAL RULES:
+- Respond ONLY with valid JSON, no extra text, no markdown fences.
+- Risk levels: critical (9-10), high (7-8), medium (4-6), low (1-3)
+
+Return this exact JSON structure:
 {
   "clause_id": "string",
   "risk_level": "critical|high|medium|low",
-  "risk_score": 1-10,
+  "risk_score": 5,
   "risk_factors": [
     {
       "factor": "string",
@@ -227,138 +310,223 @@ Call the score_clause_risk tool with the clause data provided. Output JSON forma
     }
   ],
   "recommendation": "string"
-}""",
-    tools=[score_clause_risk]
-)
+}"""
 
-# The Parallel Agent will score multiple clauses simultaneously
-risk_scoring_parallel = ParallelAgent(
-    name="risk_scoring_parallel_agent",
-    description="Scores risks for multiple clauses in parallel",
-    sub_agents=[risk_scorer_agent]  # Sub-agents to run in parallel
-)
 
-# ==================== AGENT 4: PLAYBOOK COMPARISON AGENT (Sequential + MCP) ====================
+def run_risk_scoring_agent(clauses: list[dict]) -> list[dict]:
+    """Stage 3: Score risk for all extracted clauses."""
+    scored_clauses: list[dict] = []
 
-def compare_to_playbook(clause_type: str, actual_value: str, contract_type: str) -> dict:
+    for i, clause in enumerate(clauses):
+        clause_type = clause.get("clause_type", "unknown")
+        clause_text = clause.get("text", "")
+        key_terms = clause.get("key_terms", {})
+
+        print(f"risk_scoring_agent > scoring clause {i+1}/{len(clauses)}: {clause_type}", flush=True)
+        print(f"⚠️  RiskScorer: Scoring risk for '{clause_type}' clause...", flush=True)
+
+        # First use the deterministic risk matrix
+        matrix_result = risk_matrix.evaluate_risk(clause_type, key_terms)
+
+        # Then enrich with LLM analysis
+        prompt = f"""Assess the legal risk of this contract clause.
+
+CLAUSE TYPE: {clause_type}
+CLAUSE TEXT:
+{clause_text[:1500]}
+
+KEY TERMS: {json.dumps(key_terms, indent=2)}
+MATRIX RESULT: {json.dumps(matrix_result, indent=2)}
+
+Return ONLY the JSON risk assessment object."""
+
+        raw = generate(prompt, system=RISK_SYSTEM, temperature=0.1)
+        llm_result = extract_json(raw)
+
+        if isinstance(llm_result, list):
+            if llm_result and isinstance(llm_result[0], dict):
+                llm_result = llm_result[0]
+            else:
+                llm_result = {}
+
+        if not isinstance(llm_result, dict) or llm_result.get("parse_error"):
+            # Fall back to matrix result
+            scored = {
+                "clause_id": f"clause_{i+1}_{clause_type}",
+                "risk_level": matrix_result.get("risk_level", "low"),
+                "risk_score": matrix_result.get("risk_score", 1),
+                "risk_factors": matrix_result.get("risk_factors", []),
+                "recommendation": "Review this clause carefully.",
+            }
+        else:
+            # Merge matrix factors into LLM result
+            llm_result.setdefault("clause_id", f"clause_{i+1}_{clause_type}")
+            if matrix_result.get("risk_factors"):
+                existing = llm_result.get("risk_factors", [])
+                if isinstance(existing, list):
+                    llm_result["risk_factors"] = existing + matrix_result["risk_factors"]
+                else:
+                    llm_result["risk_factors"] = matrix_result["risk_factors"]
+            scored = llm_result
+
+        scored_clause = {**clause, "risk_assessment": scored}
+        scored_clauses.append(scored_clause)
+
+    print(f"✅ risk_scoring_agent > {len(scored_clauses)} clauses scored", flush=True)
+    return scored_clauses
+
+
+# ---------------------------------------------------------------------------
+# STAGE 4 – Playbook Comparison
+# ---------------------------------------------------------------------------
+
+def run_playbook_comparison_agent(
+    scored_clauses: list[dict], contract_type: str
+) -> list[dict]:
+    """Stage 4: Compare each clause against the company playbook standards."""
+    print("playbook_comparison_agent > starting playbook comparison", flush=True)
+
+    compared_clauses: list[dict] = []
+
+    for clause in scored_clauses:
+        clause_type = clause.get("clause_type", "unknown")
+        clause_text = clause.get("text", "")
+
+        print(f"📚 PlaybookAgent: Comparing '{clause_type}' to standards...", flush=True)
+
+        comparison = compare_to_playbook(clause_type, clause_text, contract_type)
+        compared_clause = {**clause, "playbook_comparison": comparison}
+        compared_clauses.append(compared_clause)
+
+    print(f"✅ playbook_comparison_agent > {len(compared_clauses)} clauses compared", flush=True)
+    return compared_clauses
+
+
+# ---------------------------------------------------------------------------
+# STAGE 5 – Report Generator
+# ---------------------------------------------------------------------------
+
+REPORT_SYSTEM = """You are a legal contract reviewer. Write a contract review report in Markdown.
+
+RULES (follow exactly):
+- Start with # Contract Review Report as the very first line.
+- NO conversational intro. NO code fences. Raw markdown only.
+- Be concise. Aim for 300-500 words total.
+
+Sections to include:
+1. # Contract Review Report: [Type] – [Party]
+2. ## Executive Summary (2 short paragraphs)
+3. ## Critical Issues ❌ (bullet list, skip if none)
+4. ## High-Priority Issues ⚠️ (bullet list, skip if none)
+5. ## Acceptable Terms ✅ (bullet list)
+6. ## Negotiation Strategy (3-5 bullet points)
+7. ## Clause Summary (markdown table: Clause | Risk | Recommendation)
+
+Use ❌ ⚠️ ✅ emoji. Be specific and actionable."""
+
+
+def run_report_generator_agent(
+    intake_result: dict,
+    compared_clauses: list[dict],
+    filename: str,
+) -> str:
+    """Stage 5: Generate the final Markdown report using streaming to avoid timeout."""
+    print("report_generator_agent > generating final report", flush=True)
+    print("\n📝 ReportGenerator: Formatting final report...", flush=True)
+
+    # Build a compact per-clause summary (keep it small to fit in phi3's context window)
+    clause_lines = []
+    for c in compared_clauses:
+        ra = c.get("risk_assessment", {})
+        risk  = ra.get("risk_level", "low").upper()
+        score = ra.get("risk_score", 1)
+        rec   = ra.get("recommendation", "Review carefully.")[:120]
+        ctype = c.get("clause_type", "unknown")
+        preview = c.get("text", "")[:100].replace("\n", " ")
+        clause_lines.append(f"- {ctype} | {risk} ({score}/10) | {rec} | Text: {preview}")
+
+    clauses_text = "\n".join(clause_lines)
+
+    prompt = (
+        f"Write a contract review report for this contract.\n\n"
+        f"FILE: {filename}\n"
+        f"TYPE: {intake_result.get('contract_type', 'Unknown')}\n"
+        f"PARTIES: {intake_result.get('parties', {}).get('provider', '?')} / "
+        f"{intake_result.get('parties', {}).get('customer', '?')}\n"
+        f"GOVERNING LAW: {intake_result.get('governing_law', 'Unknown')}\n"
+        f"TERM: {intake_result.get('term_length', 'Unknown')}\n\n"
+        f"CLAUSES ANALYZED:\n{clauses_text}\n\n"
+        f"Start with: # Contract Review Report"
+    )
+
+    # Use streaming so we never hit a hard wall-clock timeout.
+    # Tokens are collected as they arrive; a per-token timeout of 90s
+    # catches a truly frozen model without cutting off long generations.
+    print("report_generator_agent > streaming report tokens...", flush=True)
+    report = generate_stream_collect(
+        prompt,
+        system=REPORT_SYSTEM,
+        temperature=0.2,
+        token_timeout=90,
+        print_progress=True,
+    )
+
+    # Strip any accidental code fences
+    import re
+    report = re.sub(r"^```markdown\s*\n", "", report, flags=re.MULTILINE)
+    report = re.sub(r"\n```\s*$", "", report, flags=re.MULTILINE)
+    report = report.strip()
+
+    format_markdown_report({})  # triggers progress-tracking print in app.py
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Master Workflow – called by run_single.py
+# ---------------------------------------------------------------------------
+
+class ContractReviewWorkflow:
     """
-    Compares an actual contract term against company playbook standards.
-    This function interfaces with the MCP Playbook Server.
-    
-    Args:
-        clause_type: Type of clause
-        actual_value: The actual term in the contract
-        contract_type: Type of contract
-        
-    Returns:
-        Comparison results and deviation analysis
+    Orchestrates the 5-stage contract review pipeline.
+    Replaces the Google ADK SequentialAgent / InMemoryRunner.
     """
-    print(f"\n📚 PlaybookAgent: Comparing '{clause_type}' to standards...")
-    
-    # Normalize contract type to match playbook filenames
-    normalized_type = contract_type.lower().replace(" ", "_")
-    if "employment" in normalized_type:
-        normalized_type = "employment_agreement"
-    elif "saas" in normalized_type:
-        normalized_type = "saas_agreement"
-    elif "nda" in normalized_type or "non-disclosure" in normalized_type:
-        normalized_type = "nda"
-    elif "msa" in normalized_type or "master_services" in normalized_type:
-        normalized_type = "msa"
-        
-    comparison = playbook_server.compare_term(normalized_type, clause_type, actual_value)
-    return comparison
 
-playbook_comparison_agent = Agent(
-    model=MODEL_ID,
-    name="playbook_comparison_agent",
-    description="Compares extracted clauses against the company playbook",
-    instruction="""You are a strict playbook compliance auditor. Your ONLY job is to compare the clauses provided in the context against the company's playbook standards using the `compare_to_playbook` tool.
+    name = "contract_review_workflow"
 
-INPUT DATA:
-You will receive a list of extracted clauses and their risk scores from the previous agents.
+    async def run(self, contract_text: str, filename: str, pages: int) -> str:
+        """
+        Run the complete contract review pipeline.
 
-YOUR TASK:
-1. Identify the `contract_type` from the Intake Agent's output (e.g., "Employment Agreement", "SaaS Agreement").
-2. For EACH clause provided in the context:
-    a. Determine the `clause_type` (e.g., "Compensation", "Term", "Confidentiality").
-    b. Extract the `actual_value` (the text of the clause).
-    c. IMMEDIATELY call the `compare_to_playbook(clause_type, actual_value, contract_type)` tool.
+        Args:
+            contract_text: Full extracted text of the contract PDF.
+            filename:      Original filename (for the report header).
+            pages:         Number of pages (informational).
 
-CRITICAL RULES:
-- DO NOT ask the user for information. You already have it in the conversation history.
-- DO NOT stop to ask for clarification. Make your best guess for `clause_type` and PROCEED.
-- If you cannot find a specific clause, skip it.
-- You MUST call the tool for every major clause found.
+        Returns:
+            The final Markdown report as a string.
+        """
+        # Stage 1
+        intake = run_intake_agent(contract_text, filename, pages)
+        contract_type = intake.get("contract_type", "Unknown")
 
-OUTPUT:
-Return the JSON result from the tool for each clause.""",
-    tools=[compare_to_playbook]
-)
+        # Stage 2
+        clauses = run_clause_extraction_agent(contract_text, contract_type)
 
-# ==================== AGENT 5: REPORT GENERATOR AGENT (Sequential) ====================
+        # Stage 3
+        scored = run_risk_scoring_agent(clauses)
 
-def format_markdown_report(report_data: dict) -> str:
-    """
-    Formats the final report as clean Markdown.
-    
-    Args:
-        report_data: All analysis results
-        
-    Returns:
-        Formatted Markdown report
-    """
-    print("\n📝 ReportGenerator: Formatting final report...")
-    # This is just a signal - the actual report is in the agent's text output
-    return "Report generation completed. The markdown report should be in the agent's response."
+        # Stage 4
+        compared = run_playbook_comparison_agent(scored, contract_type)
 
-report_generator_agent = Agent(
-    model=MODEL_ID,
-    name="report_generator_agent",
-    description="Synthesizes all analysis into a comprehensive Markdown report",
-    instruction="""You are a legal report writer. Create a comprehensive, readable contract review report in Markdown format.
+        # Stage 5
+        report = run_report_generator_agent(intake, compared, filename)
 
-CRITICAL: Start DIRECTLY with the report title using # (markdown header). DO NOT include any conversational text like "Sure, I can help" or "Here's the report". DO NOT wrap the output in markdown code fences (```markdown). Output ONLY raw markdown.
+        return report
 
-Structure the report:
-1. Executive Summary (3-4 paragraphs with key findings)
-2. Critical Issues ❌ (Must address before signing)
-3. High-Priority Issues ⚠️ (Should negotiate)
-4. Medium-Priority Items 🟡
-5. Acceptable Terms ✅
-6. Contract Details
-7. Negotiation Strategy
-8. Clause-by-Clause Analysis
-9. Appendices
 
-Use:
-- Clear headers and sections
-- Emoji indicators (✅ ❌ ⚠️ 🔴 🟠 🟡)
-- Tables for comparisons
-- Specific section references
-- Actionable recommendations
-- Professional but accessible tone
+# ---------------------------------------------------------------------------
+# Public exports – kept for backward-compatibility with run_single.py / run_batch.py
+# ---------------------------------------------------------------------------
 
-Write for business users, not just lawyers. Be specific and constructive.
-
-After you generate the complete report, call the format_markdown_report tool to signal completion.""",
-    tools=[format_markdown_report]
-)
-
-# ==================== MASTER WORKFLOW (Sequential) ====================
-
-# This is the root agent that orchestrates the entire workflow
-contract_review_workflow = SequentialAgent(
-    name="contract_review_workflow",
-    description="Complete contract review workflow from PDF to report",
-    sub_agents=[
-        intake_agent,
-        clause_extraction_loop,
-        risk_scoring_parallel,
-        playbook_comparison_agent,
-        report_generator_agent
-    ]
-)
-
-# This is the required root_agent for ADK
-root_agent = contract_review_workflow
+contract_review_workflow = ContractReviewWorkflow()
+root_agent = contract_review_workflow  # alias used in legacy scripts

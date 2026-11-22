@@ -1,4 +1,4 @@
-# This file is required for ADK to recognize this as a Python package
-from .agent import root_agent
+# LegalLens-AI source package
+from .agent import root_agent, contract_review_workflow
 
-__all__ = ['root_agent']
+__all__ = ["root_agent", "contract_review_workflow"]

@@ -1,82 +1,72 @@
 #!/usr/bin/env python3
 """
-Simple Contract Review Script
-Reads PDF, extracts text, and feeds it to the ADK agent using InMemoryRunner.run_debug
+Batch Contract Review Script
+Processes all PDFs in input_contracts/ and prints reports to stdout.
+
+Now uses the local Ollama backend instead of Google Gemini / Google ADK.
 """
 
 import asyncio
-import os
+import sys
 from pathlib import Path
-from src.tools.pdf_parser import DocumentParser
-from src.agent import root_agent
-from google.adk.runners import InMemoryRunner
 
-async def process_contract(contract_path: Path, runner: InMemoryRunner):
-    """Process a single contract PDF and generate review report."""
-    
+from src.tools.pdf_parser import DocumentParser
+from src.agent import contract_review_workflow
+from src.ollama_client import check_ollama_health
+
+
+async def process_contract(contract_path: Path):
+    """Process a single contract PDF and print the review report."""
+
     print(f"\n{'='*80}")
     print(f"Processing: {contract_path.name}")
     print(f"{'='*80}\n")
-    
-    # Parse PDF
+
     parser = DocumentParser()
     try:
         parsed = parser.parse(str(contract_path))
-        contract_text = parsed['text']
+        contract_text = parsed["text"]
         print(f"✓ Parsed PDF: {parsed['metadata']['pages']} pages\n")
-    except Exception as e:
-        print(f"✗ Error parsing PDF: {e}\n")
+    except Exception as exc:
+        print(f"✗ Error parsing PDF: {exc}\n")
         return
-    
-    # Create the prompt
-    prompt = f"""Please review this contract and provide a comprehensive analysis:
 
-CONTRACT: {parsed['metadata']['filename']}
-PAGES: {parsed['metadata']['pages']}
+    print("🤖 Running Ollama Multi-Agent Review...\n")
 
-TEXT:
-{contract_text}
-
-Provide a detailed contract review report."""
-    
-    print("🤖 Running ADK Multi-Agent Review...\n")
-    
     try:
-        # run_debug prints events to stdout by default (quiet=False)
-        # It handles session creation and message formatting
-        await runner.run_debug(
-            user_messages=prompt,
-            user_id="batch_user",
-            session_id=f"session_{contract_path.stem}"
+        report = await contract_review_workflow.run(
+            contract_text=contract_text,
+            filename=parsed["metadata"]["filename"],
+            pages=parsed["metadata"]["pages"],
         )
-        
-    except Exception as e:
-        print(f"\n✗ Error during agent processing: {e}")
+        print(report)
+
+    except Exception as exc:
+        print(f"\n✗ Error during agent processing: {exc}")
         import traceback
         traceback.print_exc()
 
+
 async def main():
+    # ── Health check ─────────────────────────────────────────────────────────
+    health = check_ollama_health()
+    if not health["ok"]:
+        print(f"\n❌ Ollama Error: {health['error']}")
+        print(f"\n💡 How to fix:\n{health['hint']}")
+        sys.exit(1)
+
     input_dir = Path("input_contracts")
     pdf_files = list(input_dir.glob("*.pdf"))
-    
+
     if not pdf_files:
         print("\n⚠️  No PDF files found in input_contracts/")
         print("Place your contract PDFs there and run again.\n")
         return
-    
-    # Initialize runner once
-    # We must provide app_name and agent as per previous error
-    runner = InMemoryRunner(
-        agent=root_agent,
-        app_name="contract_review_system"
-    )
-    
+
     for pdf_file in pdf_files:
-        await process_contract(pdf_file, runner)
+        await process_contract(pdf_file)
         print(f"\n{'='*80}\n")
-        
-    # Close runner to clean up resources
-    await runner.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

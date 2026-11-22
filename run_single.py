@@ -2,98 +2,79 @@
 """
 Single Contract Review Script
 Reads a specific PDF and prints the review report to stdout.
-Designed to be called by the Streamlit UI.
+Designed to be called by the Streamlit UI via subprocess.
+
+Now uses the local Ollama backend instead of Google Gemini / Google ADK.
 """
 
 import asyncio
 import sys
+
+# Force UTF-8 output so Unicode characters (emojis, checkmarks) don't crash
+# on Windows consoles that default to cp1252.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 import argparse
 from pathlib import Path
+
 from src.tools.pdf_parser import DocumentParser
-from src.agent import root_agent
-from google.adk.runners import InMemoryRunner
-from google.genai import types
+from src.agent import contract_review_workflow
+from src.ollama_client import check_ollama_health
+
 
 async def process_contract(contract_path: Path):
-    """Process a single contract PDF and generate review report."""
-    
-    # 2. Run the workflow
-    print("🤖 Agents are analyzing the contract...", flush=True)
-    
-    # Extract text first to print it for the UI
-    # We do this manually here just to expose it to the UI, 
-    # though the Intake Agent will also do it.
-    # Extract text first to print it for the UI
+    """Process a single contract PDF and print the review report to stdout."""
+
+    # ── Health check ────────────────────────────────────────────────────────
+    health = check_ollama_health()
+    if not health["ok"]:
+        print(f"\n❌ Ollama Error: {health['error']}", flush=True)
+        print(f"\n💡 How to fix:\n{health['hint']}", flush=True)
+        sys.exit(1)
+
+    # ── PDF extraction ───────────────────────────────────────────────────────
+    print("Agents are analyzing the contract...", flush=True)
+
     parser = DocumentParser()
     try:
         parsed = parser.parse(str(contract_path))
-        contract_text = parsed['text']
-        print(f"✓ PDF Parsed: {parsed['metadata']['pages']} pages found.")
-    except Exception as e:
-        print(f"Error parsing PDF: {e}")
-        return
+        contract_text = parsed["text"]
+        print(f"✓ PDF Parsed: {parsed['metadata']['pages']} pages found.", flush=True)
+    except Exception as exc:
+        print(f"Error parsing PDF: {exc}", flush=True)
+        sys.exit(1)
 
-    # Print contract text for UI to capture
-    print("\n---CONTRACT_TEXT_START---")
-    print(contract_text)
+    # Expose contract text to the Streamlit UI
+    print("\n---CONTRACT_TEXT_START---", flush=True)
+    print(contract_text, flush=True)
     print("---CONTRACT_TEXT_END---\n", flush=True)
-    
-    # Create the prompt
-    prompt = f"""Please review this contract and provide a comprehensive analysis:
 
-CONTRACT: {parsed['metadata']['filename']}
-PAGES: {parsed['metadata']['pages']}
+    print("🤖 Agents are analyzing the contract...", flush=True)
 
-TEXT:
-{contract_text}
+    # ── Run the pipeline ─────────────────────────────────────────────────────
+    print("\n---REPORT_START---\n", flush=True)
 
-Provide a detailed contract review report."""
-    
-    print("🤖 Agents are analyzing the contract...")
-    
-    # Initialize runner
-    runner = InMemoryRunner(
-        agent=root_agent,
-        app_name="contract_review_system"
-    )
-    
     try:
-        # Create session
-        session_id = f"session_{contract_path.stem}"
-        session = await runner.session_service.get_session(
-            app_name=runner.app_name,
-            user_id="streamlit_user",
-            session_id=session_id
+        report = await contract_review_workflow.run(
+            contract_text=contract_text,
+            filename=parsed["metadata"]["filename"],
+            pages=parsed["metadata"]["pages"],
         )
-        if not session:
-            session = await runner.session_service.create_session(
-                app_name=runner.app_name,
-                user_id="streamlit_user",
-                session_id=session_id
-            )
-            
-        # Use run_debug which is proven to work
-        # It prints to stdout, which we capture in app.py
-        
-        # Add a delimiter so app.py knows when the real report starts
-        print("\n---REPORT_START---\n", flush=True)
-        
-        await runner.run_debug(
-            user_messages=prompt,
-            user_id="streamlit_user",
-            session_id=session_id
-        )
-                        
-        await runner.close()
+        # Print the report to stdout so app.py can capture it
+        print(report, flush=True)
 
-    except Exception as e:
-        print(f"\nAgent Error: {e}")
+    except Exception as exc:
+        print(f"\nAgent Error: {exc}", flush=True)
         import traceback
         traceback.print_exc()
+        sys.exit(1)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("pdf_path", help="Path to the PDF file")
-    args = parser.parse_args()
-    
+    arg_parser = argparse.ArgumentParser(description="Review a single contract PDF")
+    arg_parser.add_argument("pdf_path", help="Path to the PDF file")
+    args = arg_parser.parse_args()
+
     asyncio.run(process_contract(Path(args.pdf_path)))
